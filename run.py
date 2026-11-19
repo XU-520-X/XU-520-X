@@ -2,7 +2,7 @@
 
 作用：
   1. 给本地开发补默认环境变量（用 setdefault：devfile / 显式设置的值优先，不覆盖）
-  2. 检查并自动安装缺失的 Python 依赖（fastapi / uvicorn / python-multipart）
+  2. 检查并自动安装缺失的 Python 依赖（fastapi / uvicorn / python‑multipart）
   3. 用 uvicorn 拉起 FastAPI + WebSocket 后端
 
 用法：
@@ -28,7 +28,7 @@ os.environ.setdefault("PORT", "8000")
 DEPENDENCIES = [
     ("fastapi", "fastapi>=0.110"),
     ("uvicorn", "uvicorn[standard]>=0.29"),
-    ("multipart", "python-multipart>=0.0.9"),  # 头像图片上传接口所需
+    ("multipart", "python‑multipart>=0.0.9"),  # 头像图片上传接口所需
 ]
 
 
@@ -38,7 +38,7 @@ def ensure_deps():
     if not missing:
         return
     print("[启动] 检测到缺失依赖，正在自动安装：{}".format(", ".join(missing)))
-    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check"] + missing
+    cmd = [sys.executable, "-m", "pip", "install", "--disable‑pip‑version‑check"] + missing
     try:
         subprocess.check_call(cmd)
     except subprocess.CalledProcessError as e:

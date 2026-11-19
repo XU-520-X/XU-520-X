@@ -3,4 +3,4 @@ uvicorn[standard]>=0.29
 # 头像图片上传需要（FastAPI 解析 multipart/form-data 依赖它）
 python-multipart>=0.0.9
 # 仅 DB_TYPE=mysql 时需要（SQLite 是 Python 内置，无需额外安装）
-# pymysql>=1.1
+ pymysql>=1.1

@@ -1,16 +1,12 @@
 """
 ws_server.py — 交友平台后端服务（FastAPI + WebSocket + 数据库）
-
 职责划分（与前端 交友.html 的数据模型一一对齐）：
   - REST : 注册 / 登录 / 用户列表 / 历史消息 / 会话列表
   - WS   : 消息实时推送 + 服务端持久化存储
-
-数据库连接配置全部来自环境变量（由 devfile.yaml 注入），代码里不硬编码：
+数据库连接配置全部来自环境变量，代码里不硬编码：
   DB_TYPE = sqlite | mysql                 默认 sqlite
-  DB_PATH = SQLite 数据文件路径             默认 ./data.db（必须落在持久卷上，否则容器重建数据丢失）
+  DB_PATH = SQLite 数据文件路径             默认 ./data.db
   DB_HOST / DB_PORT / DB_USER / DB_PASS / DB_NAME   MySQL 参数
-          （devfile 里组件名即 hostname，所以 DB_HOST 直接写 mysql）
-
 启动：python ws_server.py → http://127.0.0.1:8000
 """
 import os
@@ -24,7 +20,7 @@ import hashlib
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Optional  # 兼容 Python 3.8：不能用 str | None / list[dict] 这类 3.9+ 写法
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, File, UploadFile
@@ -37,16 +33,13 @@ from pydantic import BaseModel, Field
 DB_TYPE = os.getenv("DB_TYPE", "sqlite").lower()
 DB_PATH = os.getenv("DB_PATH", str(Path(__file__).parent / "data.db"))
 PORT = int(os.getenv("PORT", "8000"))
-TOKEN_TTL = int(os.getenv("TOKEN_TTL", str(7 * 24 * 3600)))  # 登录态有效期（秒）
+TOKEN_TTL = int(os.getenv("TOKEN_TTL", str(7 * 24 * 3600)))
 MAX_MSG_LEN = 2000
 
-# 头像图片改走文件存储：图片落盘、数据库只存 URL。
-# 目录默认跟着 DB_PATH 走（devfile 里只有 DB 目录挂了持久卷，容器重建图片才不丢）。
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", str(Path(DB_PATH).with_name("avatars"))))
 MAX_AVATAR_BYTES = 2 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp"}
 
-# 聊天图片/短视频、封面图统一走文件存储（与头像分开目录，方便清理与鉴权）
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", str(Path(DB_PATH).with_name("media"))))
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_VIDEO_BYTES = 50 * 1024 * 1024
@@ -55,11 +48,6 @@ ALLOWED_INTERESTS_MAX = 20
 
 
 def load_secret_key() -> str:
-    """签名密钥：优先环境变量（多副本部署必须显式指定），否则落盘复用。
-
-    文件放在 DB 同目录而不是代码目录：devfile 里只有 DB 目录挂了持久卷，
-    密钥若随容器重建而变，所有用户的登录态会被集体踢下线。
-    """
     env = os.getenv("SECRET_KEY")
     if env:
         return env
@@ -144,12 +132,12 @@ DDL_MYSQL = [
 
 
 class DB:
-    """极简数据库适配层：屏蔽 sqlite / mysql 的占位符差异，后续换库不动业务代码"""
+    """极简数据库适配层：屏蔽 sqlite / mysql 的占位符差异"""
 
     def __init__(self):
         self.lock = threading.Lock()
         if DB_TYPE == "mysql":
-            import pymysql  # 仅 DB_TYPE=mysql 时需要
+            import pymysql
             self.conn = pymysql.connect(
                 host=os.getenv("DB_HOST", "127.0.0.1"),
                 port=int(os.getenv("DB_PORT", "3306")),
@@ -182,10 +170,12 @@ class DB:
         return [dict(zip(cols, r)) for r in rows]
 
 
-db = DB()
+# 导入阶段不创建数据库连接，避免构建时触发 MySQL 连接报错
+db = None
 
 
 def init_db():
+    global db
     for ddl in (DDL_MYSQL if DB_TYPE == "mysql" else DDL_SQLITE):
         db.execute(ddl)
     ensure_schema()
@@ -202,7 +192,6 @@ def init_db():
                 (username, hash_pwd("123456"), nickname, gender, bio, avatar, age, dump_interests(interests)),
             )
         print(f"[init] 已写入 4 个演示用户（密码均为 123456），DB_TYPE={DB_TYPE}")
-    # 引入好友门槛后：历史会话回填成好友 + 演示用户预置互加，避免老对话发不出消息
     backfill_friendships()
     seed_demo_friendships()
 
@@ -220,18 +209,16 @@ def _has_column(table: str, name: str) -> bool:
 
 
 def _ensure_column(table: str, name: str, sqlite_type: str, mysql_type: str):
-    """幂等补列（列已存在则跳过），专用于旧库升级"""
     if _has_column(table, name):
         return
     t = sqlite_type if DB_TYPE == "sqlite" else mysql_type
     try:
         db.execute("ALTER TABLE {} ADD COLUMN {} {}".format(table, name, t))
     except Exception:
-        pass  # 并发/重复列等异常一律忽略，列已在下一轮存在
+        pass
 
 
 def ensure_schema():
-    """旧库升级：幂等补齐 messages.read_at/msg_type 与 users.age/interests/cover"""
     _ensure_column("messages", "read_at", "INTEGER", "BIGINT")
     _ensure_column("messages", "msg_type", "TEXT DEFAULT 'text'", "VARCHAR(8) DEFAULT 'text'")
     _ensure_column("users", "age", "INTEGER", "INT")
@@ -240,13 +227,11 @@ def ensure_schema():
 
 
 def backfill_friendships():
-    """把已有过消息往来的双方补成好友（幂等）"""
     for r in db.query("SELECT DISTINCT sender, recipient FROM messages"):
         add_friendship(r["sender"], r["recipient"])
 
 
 def seed_demo_friendships():
-    """演示用户两两互加好友，保证开箱即用"""
     for i, a in enumerate(DEMO_USERNAMES):
         for b in DEMO_USERNAMES[i + 1:]:
             if user_exists(a) and user_exists(b):
@@ -258,7 +243,6 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9_\u4e00-\u9fa5]{1,32}$")
 
 
 def hash_pwd(pwd: str) -> str:
-    """pbkdf2_hmac + 每用户随机盐（纯标准库，不引入额外依赖）"""
     salt = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt, PBKDF2_ITERATIONS)
     return "pbkdf2${}${}${}".format(PBKDF2_ITERATIONS, salt.hex(), dk.hex())
@@ -274,7 +258,6 @@ def verify_pwd(pwd: str, stored: str) -> bool:
         except ValueError:
             return False
         return hmac.compare_digest(dk.hex(), hash_hex)
-    # 兼容旧数据：之前 seed 进去的是无盐 sha256，登录成功后会被透明升级成 pbkdf2
     return hmac.compare_digest(hashlib.sha256(pwd.encode("utf-8")).hexdigest(), stored)
 
 
@@ -287,7 +270,6 @@ def _b64d(text: str) -> bytes:
 
 
 def issue_token(username: str) -> dict:
-    """HMAC 签名的白拿 token：payload.signature，无需引入 PyJWT"""
     exp = int(time.time()) + TOKEN_TTL
     payload = _b64e(json.dumps({"u": username, "exp": exp}, separators=(",", ":")).encode("utf-8"))
     sig = _b64e(hmac.new(SECRET_KEY.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest())
@@ -295,7 +277,6 @@ def issue_token(username: str) -> dict:
 
 
 def verify_token(token: Optional[str]) -> Optional[str]:
-    """校签 + 校过期，通过则返回 username，否则 None"""
     if not token or token.count(".") != 1:
         return None
     payload, sig = token.split(".")
@@ -316,7 +297,6 @@ def user_exists(username: str) -> bool:
 
 
 def require_auth(authorization: Optional[str] = Header(None)) -> str:
-    """REST 统一鉴权依赖：从 Authorization: Bearer <token> 取出当前登录用户"""
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "未登录或登录凭证缺失")
     username = verify_token(authorization[7:].strip())
@@ -328,8 +308,6 @@ def require_auth(authorization: Optional[str] = Header(None)) -> str:
 
 
 def optional_auth(authorization: Optional[str] = Header(None)) -> Optional[str]:
-    """与 require_auth 同样的取 token 逻辑，但不报错：无/无效 token 返回 None。
-    用于注册阶段（尚未登录）的图片上传——只落盘拿 URL，不动数据库。"""
     if not authorization or not authorization.lower().startswith("bearer "):
         return None
     username = verify_token(authorization[7:].strip())
@@ -343,12 +321,10 @@ def get_chat_key(u1: str, u2: str) -> str:
 
 
 def are_friends(a: str, b: str) -> bool:
-    """friendships 双向存两行，查一行即可判定“是否好友”"""
     return bool(db.query("SELECT 1 AS x FROM friendships WHERE username=? AND friend=?", (a, b)))
 
 
 def add_friendship(a: str, b: str):
-    """幂等写入双向关系（a==b 或已存在则跳过）"""
     if not a or not b or a == b:
         return
     ts = int(time.time() * 1000)
@@ -368,7 +344,6 @@ def pending_request(from_user: str, to_user: str) -> bool:
 
 
 def mark_messages_read(me: str, peer: str) -> int:
-    """把 peer 发给我、我尚未读的消息标记为已读，返回本次新标记条数"""
     ts = int(time.time() * 1000)
     cur = db.execute(
         "UPDATE messages SET read_at=? WHERE chat_key=? AND recipient=? AND sender=? AND read_at IS NULL",
@@ -381,16 +356,34 @@ def mark_messages_read(me: str, peer: str) -> int:
 app = FastAPI(title="交友平台 WebSocket 后端")
 app.add_middleware(
     CORSMiddleware,
-    # 前端可能以 file:// 或其他端口打开，开发环境放开；生产请收紧为具体域名
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 头像图片静态服务：上传落盘到 UPLOAD_DIR（持久卷），对外路径 /uploads/avatars/<文件>
+
+# 服务启动后再连接数据库、建表；构建阶段不会执行
+@app.on_event("startup")
+def startup_event():
+    global db
+    db = DB()
+    init_db()
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    global db
+    if db is not None and hasattr(db, "conn"):
+        try:
+            db.conn.close()
+        except Exception:
+            pass
+    db = None
+
+
+# 静态资源目录（启动后目录已就绪）
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads/avatars", StaticFiles(directory=str(UPLOAD_DIR)), name="avatars")
-# 聊天图片/短视频、封面图静态服务：落盘到 MEDIA_DIR，对外路径 /uploads/media/<文件>
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
@@ -412,11 +405,10 @@ class LoginIn(BaseModel):
 
 
 class SendIn(BaseModel):
-    # sender 字段已废弃：发送者身份只从 token 推导，客户端传什么都不信
     sender: str = ""
     recipient: str
     content: str = Field(min_length=1, max_length=MAX_MSG_LEN)
-    kind: str = "text"  # text | image | video
+    kind: str = "text"
 
 
 class FriendReqIn(BaseModel):
@@ -424,17 +416,15 @@ class FriendReqIn(BaseModel):
 
 
 class FriendRespondIn(BaseModel):
-    target: str   # 待处理的好友申请发起方用户名
+    target: str
     accept: bool
 
 
 class AvatarUrlIn(BaseModel):
-    # 登录后可直接提交的头像：emoji 或 /uploads/avatars/xxx 这类 URL（不再收 base64）
     avatar: str = Field(max_length=256)
 
 
 class ProfileIn(BaseModel):
-    # 个人中心“全部可编辑”：传哪个字段改哪个，None 表示不动
     nickname: Optional[str] = None
     gender: Optional[str] = None
     age: Optional[int] = None
@@ -444,12 +434,10 @@ class ProfileIn(BaseModel):
     cover: Optional[str] = None
 
 
-# 对外公开的用户列（所有查 user 再交给 public_user 的地方统一用）
 USER_PUBLIC_COLS = "username, nickname, gender, bio, avatar, age, interests, cover"
 
 
 def parse_interests(raw) -> list:
-    """interests 列存 JSON 字符串；兼容旧数据按逗号分隔，都解成字符串列表"""
     if not raw:
         return []
     try:
@@ -462,7 +450,6 @@ def parse_interests(raw) -> list:
 
 
 def dump_interests(items) -> str:
-    """列表去重、限长后序列化为 JSON 字符串入库"""
     cleaned = []
     for x in (items or []):
         s = str(x).strip()[:24]
@@ -472,7 +459,6 @@ def dump_interests(items) -> str:
 
 
 def public_user(row: dict) -> dict:
-    """去掉 password，避免密码散列外泄；补充 age/interests/cover 并做格式归一"""
     out = {k: row[k] for k in ("username", "nickname", "gender", "bio", "avatar") if k in row}
     age = row.get("age")
     out["age"] = int(age) if age else None
@@ -482,7 +468,6 @@ def public_user(row: dict) -> dict:
 
 
 def row_to_msg(row: dict) -> dict:
-    """转成前端使用的字段名：from / to / content / time(毫秒) / read / kind"""
     return {
         "from": row["sender"],
         "to": row["recipient"],
@@ -494,7 +479,6 @@ def row_to_msg(row: dict) -> dict:
 
 
 def msg_preview(content: str, kind: str) -> str:
-    """会话列表预览：媒体消息不显示 URL，显占位文案"""
     if kind == "image":
         return "[图片]"
     if kind == "video":
@@ -518,7 +502,6 @@ def health():
 
 @app.get("/api/me")
 def me_info(me: str = Depends(require_auth)):
-    """当前登录者资料：刷新页面后恢复会话用（不能用 /api/users 查自己，那个接口排除了自己）"""
     rows = db.query("SELECT username, nickname, gender, bio, avatar, age, interests, cover FROM users WHERE username=?", (me,))
     if not rows:
         raise HTTPException(404, "账号不存在")
@@ -527,7 +510,6 @@ def me_info(me: str = Depends(require_auth)):
 
 @app.get("/api/users")
 def list_users(me: str = Depends(require_auth)):
-    """广场列表：排除自己由服务端根据 token 决定，不再依赖客户端传 exclude"""
     rows = db.query("SELECT username, nickname, gender, bio, avatar, age, interests, cover FROM users")
     return [public_user(r) for r in rows if r["username"] != me]
 
@@ -541,9 +523,9 @@ def register(body: RegisterIn):
         raise HTTPException(409, "该账号已被注册")
     avatar = body.avatar.strip()
     if not _is_safe_avatar(avatar):
-        raise HTTPException(400, "头像只能是 emoji 或上传图片（不支持 base64）")
+        raise HTTPException(400, "头像只能是 emoji 或上传图片")
     if body.age < 0 or body.age > 120:
-        raise HTTPException(400, "年龄需在 0-120 之间（0 表示未填写）")
+        raise HTTPException(400, "年龄需在 0-120 之间")
     db.execute(
         "INSERT INTO users(username, password, nickname, gender, bio, avatar, age, interests) VALUES(?,?,?,?,?,?,?,?)",
         (username, hash_pwd(body.password), body.nickname.strip(), body.gender, body.bio, avatar,
@@ -556,11 +538,9 @@ def register(body: RegisterIn):
 def login(body: LoginIn):
     rows = db.query("SELECT * FROM users WHERE username=?", (body.username,))
     if not rows or not verify_pwd(body.password, rows[0]["password"]):
-        # 统一返回同一个错，不区分“账号不存在/密码错”，避免账号枚举
         raise HTTPException(401, "账号或密码错误")
     user = rows[0]
     if not user["password"].startswith("pbkdf2$"):
-        # 旧的无盐 sha256 散列，登录成功这一次顺手升级
         db.execute("UPDATE users SET password=? WHERE username=?", (hash_pwd(body.password), user["username"]))
     result = public_user(user)
     result.update(issue_token(user["username"]))
@@ -569,7 +549,6 @@ def login(body: LoginIn):
 
 @app.get("/api/messages")
 def get_messages(target: str, me: str = Depends(require_auth)):
-    """历史消息：只允许查自己参与的会话（chat_key 包含 me，天然隔离别人的聊天记录）"""
     rows = db.query("SELECT sender, recipient, content, ts, read_at, msg_type FROM messages WHERE chat_key=? ORDER BY ts ASC",
                     (get_chat_key(me, target),))
     return [row_to_msg(r) for r in rows]
@@ -577,7 +556,6 @@ def get_messages(target: str, me: str = Depends(require_auth)):
 
 @app.post("/api/messages")
 def send_message(body: SendIn, me: str = Depends(require_auth)):
-    """HTTP 兜底发送（WS 断线时用），发送者强制为当前登录用户"""
     if body.recipient == me:
         raise HTTPException(400, "不能给自己发消息")
     if not db.query("SELECT username FROM users WHERE username=?", (body.recipient,)):
@@ -593,7 +571,6 @@ def send_message(body: SendIn, me: str = Depends(require_auth)):
 
 @app.get("/api/chats")
 def list_chats(me: str = Depends(require_auth)):
-    """会话列表：取该用户参与的每个会话的最后一条消息"""
     user = me
     mine = db.query("SELECT chat_key FROM messages WHERE sender=? OR recipient=? GROUP BY chat_key",
                     (user, user))
@@ -619,7 +596,6 @@ def list_chats(me: str = Depends(require_auth)):
 # ==================== 好友申请 / 好友关系 ====================
 @app.get("/api/friends")
 async def list_friends(me: str = Depends(require_auth)):
-    """我的好友列表（返回公开资料）"""
     out = []
     for r in db.query("SELECT friend FROM friendships WHERE username=?", (me,)):
         u = db.query("SELECT username, nickname, gender, bio, avatar, age, interests, cover FROM users WHERE username=?", (r["friend"],))
@@ -630,7 +606,6 @@ async def list_friends(me: str = Depends(require_auth)):
 
 @app.get("/api/friends/requests")
 async def friend_requests(me: str = Depends(require_auth)):
-    """待处理好友申请：incoming=别人加我，outgoing=我加别人（还在等待）"""
     incoming = []
     for r in db.query(
             "SELECT from_user AS other FROM friend_requests WHERE to_user=? AND status='pending'", (me,)):
@@ -657,7 +632,6 @@ async def send_friend_request(body: FriendReqIn, me: str = Depends(require_auth)
             "INSERT INTO friend_requests(from_user, to_user, status, ts) VALUES(?,?,?,?)",
             (me, to, "pending", int(time.time() * 1000)),
         )
-    # 实时通知对方：我发起了好友申请
     await push(to, {"type": "friend_request", "from": me, "user": public_user(target[0])})
     return {"ok": True}
 
@@ -684,7 +658,6 @@ async def respond_friend_request(body: FriendRespondIn, me: str = Depends(requir
 
 # ==================== 头像：图片文件存储 ====================
 def _is_safe_avatar(val: str) -> bool:
-    """头像只允许：emoji（短、无标签）或站内上传 URL；拒绝 base64/data: 入库"""
     if val == "":
         return True
     if val.startswith("/uploads/avatars/") and "<" not in val:
@@ -695,7 +668,6 @@ def _is_safe_avatar(val: str) -> bool:
 
 
 def _delete_old_avatar(avatar):
-    """只删我们自己落盘的图片（emoji / 外链不动），删失败无所谓"""
     if avatar and avatar.startswith("/uploads/avatars/"):
         p = UPLOAD_DIR / Path(avatar).name
         try:
@@ -707,7 +679,6 @@ def _delete_old_avatar(avatar):
 
 @app.post("/api/avatar")
 async def upload_avatar(file: UploadFile = File(...), me: Optional[str] = Depends(optional_auth)):
-    """图片上传：落盘到持久卷、返回 URL。已登录直接写库并换头像；未登录（注册阶段）仅暂存。"""
     ext = ALLOWED_IMAGE_TYPES.get((file.content_type or "").lower())
     if not ext:
         raise HTTPException(400, "仅支持 jpg/png/gif/webp 图片")
@@ -726,7 +697,6 @@ async def upload_avatar(file: UploadFile = File(...), me: Optional[str] = Depend
 
 @app.post("/api/me/avatar")
 async def set_my_avatar(body: AvatarUrlIn, me: str = Depends(require_auth)):
-    """登录后直接换头像（emoji 或已上传 URL，不收 base64）"""
     val = body.avatar.strip()
     if not _is_safe_avatar(val):
         raise HTTPException(400, "头像只能是 emoji 或站内上传图片 URL")
@@ -738,14 +708,12 @@ async def set_my_avatar(body: AvatarUrlIn, me: str = Depends(require_auth)):
 
 # ==================== 个人资料编辑 / 媒体上传 ====================
 def _is_safe_image(val) -> bool:
-    """封面/媒体地址：允许空或站内 /uploads/ URL，拒绝 base64/外链"""
     if val is None or val == "":
         return True
     return isinstance(val, str) and val.startswith("/uploads/") and "<" not in val
 
 
 def _delete_managed_file(url):
-    """删除我们自己落盘的上传文件（头像/媒体），emoji、外链、非本站路径不动"""
     if not url:
         return
     if url.startswith("/uploads/avatars/"):
@@ -763,7 +731,6 @@ def _delete_managed_file(url):
 
 @app.put("/api/me")
 async def update_me(body: ProfileIn, me: str = Depends(require_auth)):
-    """个人中心保存：按传入字段局部更新，None 不动"""
     row = db.query("SELECT {} FROM users WHERE username=?".format(USER_PUBLIC_COLS), (me,))
     if not row:
         raise HTTPException(404, "账号不存在")
@@ -807,8 +774,6 @@ async def update_me(body: ProfileIn, me: str = Depends(require_auth)):
 
 @app.post("/api/media")
 async def upload_media(file: UploadFile = File(...), me: str = Depends(require_auth)):
-    """聊天图片/短视频上传：按类型校验大小、落盘到 MEDIA_DIR，返回 {url, kind}。
-    封面图也复用此接口上传，再通过 PUT /api/me 写库。"""
     ctype = (file.content_type or "").lower()
     ext = ALLOWED_IMAGE_TYPES.get(ctype)
     kind, limit = "image", MAX_IMAGE_BYTES
@@ -827,7 +792,6 @@ async def upload_media(file: UploadFile = File(...), me: str = Depends(require_a
 
 @app.get("/api/profile")
 def get_profile(username: str, me: str = Depends(require_auth)):
-    """查看某个用户的主页资料（弹窗用）：排除密码，含 age/interests/cover"""
     rows = db.query("SELECT {} FROM users WHERE username=?".format(USER_PUBLIC_COLS), (username,))
     if not rows:
         raise HTTPException(404, "用户不存在")
@@ -835,7 +799,6 @@ def get_profile(username: str, me: str = Depends(require_auth)):
 
 
 # ==================== WebSocket：在线表 + 实时推送 ====================
-# 在线连接表：username -> WebSocket
 connected = {}
 
 
@@ -850,7 +813,6 @@ def save_message(sender: str, recipient: str, content: str, kind: str = "text") 
 
 
 async def push(username: str, payload: dict) -> bool:
-    """对方在线就直接推；离线则只落库，等其拉取历史消息"""
     ws = connected.get(username)
     if not ws:
         return False
@@ -860,15 +822,11 @@ async def push(username: str, payload: dict) -> bool:
 
 @app.websocket("/ws/{username}")
 async def chat_ws(websocket: WebSocket, username: str):
-    # 浏览器的 WebSocket 无法自定义请求头，token 只能走 query 参数
     if verify_token(websocket.query_params.get("token")) != username:
-        # 未 accept 就 close：在握手阶段直接拒绝（HTTP 403），不给它建通道
         await websocket.close(code=1008)
         return
     await websocket.accept()
     connected[username] = websocket
-    # 先把“已在线的人”全量同步给新连接：presence 是增量事件，
-    # 不做这一步会导致在线名单永远缺少先登录的那些人
     peers = [u for u in connected if u != username]
     await websocket.send_text(json.dumps({"type": "presence_sync", "users": peers}, ensure_ascii=False))
     await broadcast_presence(username, True)
@@ -885,12 +843,10 @@ async def chat_ws(websocket: WebSocket, username: str):
             if mtype == "ping":
                 await websocket.send_text(json.dumps({"type": "pong", "time": int(time.time() * 1000)}))
             elif mtype == "typing":
-                # 纯瞬时信号，不落库，对方在线就转一下
                 to = data.get("to")
                 if to:
                     await push(to, {"type": "typing", "from": username})
             elif mtype == "read":
-                # 我打开了与 to 的会话：把我收到、还没读的消息标为已读，有变更再告知对方
                 to = data.get("to")
                 if to and to != username and user_exists(to) and mark_messages_read(username, to):
                     await push(to, {"type": "read", "by": username})
@@ -918,7 +874,6 @@ async def chat_ws(websocket: WebSocket, username: str):
                         {"type": "error", "msg": "你们还不是好友，请先添加好友"}, ensure_ascii=False))
                     continue
                 record = save_message(username, to, content, kind)
-                # 回执给发送方（气泡上屏）+ 推给接收方（实时到达）
                 await websocket.send_text(json.dumps({"type": "ack", "data": record}, ensure_ascii=False))
                 await push(to, {"type": "message", "data": record})
     except WebSocketDisconnect:
@@ -930,7 +885,6 @@ async def chat_ws(websocket: WebSocket, username: str):
 
 
 async def broadcast_presence(username: str, online: bool):
-    """给所有在线用户广播上下线状态（好友列表灰点/绿点）"""
     payload = json.dumps({"type": "presence", "username": username, "online": online}, ensure_ascii=False)
     for name, ws in list(connected.items()):
         if name != username:
@@ -941,8 +895,7 @@ async def broadcast_presence(username: str, online: bool):
 
 
 # ==================== 入口 ====================
-init_db()
-
+# 建库/建表由 startup 事件触发，构建阶段不执行
 if __name__ == "__main__":
     print(f"WebSocket 后端启动： http://127.0.0.1:{PORT}   （数据库：{DB_TYPE}）")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
